@@ -31,7 +31,49 @@ function buildOutputPath(jobId, container) {
   return path.join(os.tmpdir(), `dmosh-${jobId}.${safeContainer}`);
 }
 
-function executeRender(job, { width, height, fps, container, codec }) {
+function computeDurationSeconds(settings) {
+  if (!settings || typeof settings !== 'object') {
+    return 5;
+  }
+
+  const fps = Number.isFinite(settings.fps) && settings.fps > 0 ? settings.fps : 24;
+
+  let frameCount = null;
+  const source = settings.source;
+
+  if (source && typeof source === 'object') {
+    const { inFrame, outFrame } = source;
+    if (
+      typeof inFrame === 'number' &&
+      typeof outFrame === 'number' &&
+      Number.isFinite(inFrame) &&
+      Number.isFinite(outFrame) &&
+      outFrame >= inFrame
+    ) {
+      frameCount = outFrame - inFrame + 1;
+    }
+  }
+
+  let durationSeconds;
+
+  if (frameCount && frameCount > 0) {
+    durationSeconds = frameCount / fps;
+  } else {
+    durationSeconds = 5;
+  }
+
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    durationSeconds = 5;
+  }
+
+  const minSeconds = 0.5;
+  const maxSeconds = 60;
+  durationSeconds = Math.min(maxSeconds, Math.max(minSeconds, durationSeconds));
+
+  return durationSeconds;
+}
+
+function executeRender(job, { width, height, fps, container, codec, durationSeconds }) {
   const outputPath = buildOutputPath(job.id, container);
   if (fs.existsSync(outputPath)) {
     try {
@@ -48,12 +90,15 @@ function executeRender(job, { width, height, fps, container, codec }) {
       args.push('-movflags +faststart');
     }
 
+    const durationStr = durationSeconds.toFixed(3);
+    const colorInput = `color=c=black:s=${width}x${height}:r=${fps}:d=${durationStr}`;
+
     ffmpeg()
-      .input(`color=c=black:s=${width}x${height}:r=${fps}:d=1.0`)
+      .input(colorInput)
       .inputFormat('lavfi')
       .videoCodec(codec)
       .fps(fps)
-      .duration(1.0)
+      .duration(durationSeconds)
       .outputOptions(args)
       .format(container)
       .on('progress', (progress) => {
@@ -76,19 +121,45 @@ function executeRender(job, { width, height, fps, container, codec }) {
 }
 
 async function runExport(job, project, settings) {
-  const width = settings.width ?? 640;
-  const height = settings.height ?? 360;
-  const fps = settings.fps ?? 24;
-  const container = sanitizeContainer(settings.container);
-  const desiredCodec = sanitizeCodec(settings.videoCodec);
+  const {
+    width: settingsWidth,
+    height: settingsHeight,
+    fps: settingsFps,
+    source: settingsSource,
+    fileName,
+    container,
+    videoCodec,
+    audioCodec,
+  } = settings || {};
+
+  const width = Number.isFinite(settingsWidth) && settingsWidth > 0 ? settingsWidth : 640;
+  const height = Number.isFinite(settingsHeight) && settingsHeight > 0 ? settingsHeight : 360;
+  const fps = Number.isFinite(settingsFps) && settingsFps > 0 ? settingsFps : 24;
+  const renderDuration = computeDurationSeconds({ fps, source: settingsSource });
+  const safeContainer = sanitizeContainer(container);
+  const desiredCodec = sanitizeCodec(videoCodec);
 
   try {
-    return await executeRender(job, { width, height, fps, container, codec: desiredCodec });
+    return await executeRender(job, {
+      width,
+      height,
+      fps,
+      container: safeContainer,
+      codec: desiredCodec,
+      durationSeconds: renderDuration,
+    });
   } catch (error) {
     if (desiredCodec === 'libx265') {
       // Attempt fallback if libx265 is unavailable
       job.progress = 0;
-      return executeRender(job, { width, height, fps, container, codec: codecMap.h264 });
+      return executeRender(job, {
+        width,
+        height,
+        fps,
+        container: safeContainer,
+        codec: codecMap.h264,
+        durationSeconds: renderDuration,
+      });
     }
     throw error;
   }
@@ -96,4 +167,5 @@ async function runExport(job, project, settings) {
 
 module.exports = {
   runExport,
+  computeDurationSeconds,
 };
