@@ -9,21 +9,71 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 const JOBS = new Map();
 const TMP_DIR = path.join(os.tmpdir(), 'dmosh-export-service');
+const MAX_CONCURRENT_FFMPEG = parseInt(process.env.MAX_CONCURRENT_FFMPEG || '2', 10);
+let activeRenders = 0;
 
 if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
-// Safety caps for stub rendering (can be relaxed/removed later)
-const MAX_WIDTH = 1920;          // max output width for stub
-const MAX_HEIGHT = 1080;         // max output height for stub
-const MAX_FPS = 60;              // max fps for stub
-const MAX_DURATION_SECONDS = 60; // max duration (seconds) for stub
+const SOFT_MAX_WIDTH = 3840;
+const SOFT_MAX_HEIGHT = 2160;
+const SOFT_MAX_DURATION_SECONDS = 10 * 60;
+const EXTREME_MAX_DIMENSION = 8192;
+const EXTREME_MAX_DURATION_SECONDS = 60 * 60;
 
 function approxUncompressedGB(width, height, fps, seconds, bytesPerPixel = 4) {
   const frames = fps * seconds;
   const bytes = width * height * frames * bytesPerPixel;
   return bytes / (1024 * 1024 * 1024);
+}
+
+function resolveSourcePathFromProject(project, settings) {
+  const mediaRoot = process.env.MEDIA_ROOT || process.cwd();
+  const source = settings.source || { kind: 'timeline' };
+
+  let sourceObj = null;
+
+  if (source.kind === 'source' && source.sourceId && Array.isArray(project?.sources)) {
+    sourceObj = project.sources.find((s) => s.id === source.sourceId) || null;
+  } else if (source.kind === 'clip' && source.clipId && Array.isArray(project?.timeline?.clips)) {
+    const clip = project.timeline.clips.find((c) => c.id === source.clipId);
+    if (clip && Array.isArray(project.sources)) {
+      sourceObj = project.sources.find((s) => s.id === clip.sourceId) || null;
+    }
+  } else if (source.kind === 'timeline' && Array.isArray(project?.timeline?.clips) && project.timeline.clips.length === 1) {
+    const clip = project.timeline.clips[0];
+    if (Array.isArray(project.sources)) {
+      sourceObj = project.sources.find((s) => s.id === clip.sourceId) || null;
+    }
+  }
+
+  if (!sourceObj) {
+    return null;
+  }
+
+  const originalName = sourceObj.originalName || '';
+  const extFromName = path.extname(originalName) || '.mp4';
+  const hash = sourceObj.hash || '';
+
+  const candidates = [];
+
+  if (hash) {
+    candidates.push(path.join(mediaRoot, `${hash}${extFromName}`));
+    candidates.push(path.join(mediaRoot, hash));
+  }
+
+  if (originalName) {
+    candidates.push(path.join(mediaRoot, originalName));
+  }
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 function logMemory(label) {
@@ -55,14 +105,6 @@ function deriveRenderParams(project, settings) {
   width = Math.max(16, Math.round(width * scale));
   height = Math.max(16, Math.round(height * scale));
 
-  // Keep copies before clamping
-  const unclampedWidth = width;
-  const unclampedHeight = height;
-
-  // Clamp to safety caps
-  width = Math.min(width, MAX_WIDTH);
-  height = Math.min(height, MAX_HEIGHT);
-
   const projectFps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
   let fps = projectFps;
 
@@ -75,18 +117,8 @@ function deriveRenderParams(project, settings) {
     fps = 24;
   }
 
-  const unclampedFps = fps;
-  fps = Math.min(fps, MAX_FPS);
-
   const durationFrames = computeDurationFrames(project, settings);
-  let durationSeconds = durationFrames / fps;
-
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    durationSeconds = 1;
-  }
-
-  const unclampedDurationSeconds = durationSeconds;
-  durationSeconds = Math.min(durationSeconds, MAX_DURATION_SECONDS);
+  const durationSeconds = Math.max(0.1, durationFrames / fps);
 
   if (process.env.NODE_ENV !== 'production') {
     const approxGB = approxUncompressedGB(width, height, fps, durationSeconds);
@@ -97,14 +129,10 @@ function deriveRenderParams(project, settings) {
       settingsWidth: settings.width,
       settingsHeight: settings.height,
       scale,
-      unclampedWidth,
-      unclampedHeight,
       width,
       height,
-      unclampedFps,
       fps,
       durationFrames,
-      unclampedDurationSeconds,
       durationSeconds,
       approxUncompressedGB: approxGB.toFixed(3),
     });
@@ -204,8 +232,25 @@ function pruneOldJobs() {
   }
 }
 
-function startStubRender(job, project, settings) {
+function startRender(job, project, settings, onDone) {
   const { width, height, fps, durationSeconds } = deriveRenderParams(project, settings);
+
+  if (width > SOFT_MAX_WIDTH || height > SOFT_MAX_HEIGHT) {
+    console.warn('[dmosh-export-service] large resolution requested', { id: job.id, width, height });
+  }
+
+  if (durationSeconds > SOFT_MAX_DURATION_SECONDS) {
+    console.warn('[dmosh-export-service] long duration requested', { id: job.id, durationSeconds });
+  }
+
+  if (width > EXTREME_MAX_DIMENSION || height > EXTREME_MAX_DIMENSION || durationSeconds > EXTREME_MAX_DURATION_SECONDS) {
+    job.status = 'failed';
+    job.error = 'job_too_large';
+    if (typeof onDone === 'function') {
+      onDone();
+    }
+    return;
+  }
 
   const container = settings.container || 'mp4';
   const outputPath = path.join(TMP_DIR, `${job.id}.${container}`);
@@ -216,9 +261,14 @@ function startStubRender(job, project, settings) {
   job.downloadPath = outputPath;
 
   const codec = mapVideoCodec(settings.videoCodec, container);
+  const pixelFormat = settings.pixelFormat || 'yuv420p';
+  const inputPath = resolveSourcePathFromProject(project, settings);
+
+  let command;
+  let usingRealContent = false;
 
   if (process.env.NODE_ENV !== 'production') {
-    console.log('[dmosh-export-service] starting stub render', {
+    console.log('[dmosh-export-service] starting render', {
       id: job.id,
       width,
       height,
@@ -226,6 +276,7 @@ function startStubRender(job, project, settings) {
       durationSeconds,
       container,
       codec,
+      inputPath,
       outputPath,
     });
   }
@@ -242,21 +293,76 @@ function startStubRender(job, project, settings) {
 
   logMemory(`job ${job.id} start`);
 
-  const input = `color=c=black:s=${width}x${height}:r=${fps}:d=${durationSeconds}`;
+  if (inputPath) {
+    usingRealContent = true;
+    const source = settings.source || { kind: 'timeline' };
 
-  const command = ffmpeg(input)
-    .inputFormat('lavfi')
-    .videoCodec(codec)
-    .outputOptions(['-pix_fmt', settings.pixelFormat || 'yuv420p'])
-    .noAudio()
+    command = ffmpeg(inputPath);
+
+    const needsScale =
+      settings.outputResolution === 'custom' ||
+      (width !== project?.settings?.width || height !== project?.settings?.height);
+
+    if (needsScale) {
+      command = command.videoFilters(`scale=${width}:${height}`);
+    }
+
+    let effectiveFps = fps;
+    if (settings.fpsMode === 'override' && settings.fps) {
+      effectiveFps = settings.fps;
+    }
+
+    if (effectiveFps && typeof effectiveFps === 'number') {
+      command = command.outputOptions(['-r', String(effectiveFps)]);
+    }
+
+    if (source.kind === 'timeline' && typeof source.inFrame === 'number' && typeof source.outFrame === 'number') {
+      const inSec = source.inFrame / fps;
+      const outSec = source.outFrame / fps;
+      command = command.setStartTime(inSec).outputOptions(['-t', String(Math.max(0.1, outSec - inSec))]);
+    }
+
+    const canCopyVideo =
+      settings.outputResolution !== 'custom' &&
+      !needsScale &&
+      settings.fpsMode === 'project' &&
+      (settings.rateControl?.mode === 'bitrate' || settings.rateControl?.mode === 'crf') &&
+      (settings.videoCodec === 'h264' || !settings.videoCodec) &&
+      (container === 'mp4' || container === 'mkv' || container === 'mov');
+
+    if (canCopyVideo) {
+      command = command.videoCodec('copy');
+      if (settings.includeAudio && settings.audioCodec && settings.audioCodec !== 'none') {
+        command = command.audioCodec('copy');
+      } else {
+        command = command.noAudio();
+      }
+    } else {
+      command = command.videoCodec(codec).outputOptions(['-pix_fmt', pixelFormat]);
+
+      if (settings.includeAudio && settings.audioCodec && settings.audioCodec !== 'none') {
+        command = command.audioCodec(settings.audioCodec);
+      } else {
+        command = command.noAudio();
+      }
+    }
+  } else {
+    const input = `color=c=black:s=${width}x${height}:r=${fps}:d=${durationSeconds}`;
+    command = ffmpeg(input)
+      .inputFormat('lavfi')
+      .videoCodec(codec)
+      .outputOptions(['-pix_fmt', pixelFormat])
+      .noAudio();
+  }
+
+  command
     .on('start', (cmdLine) => {
       if (process.env.NODE_ENV !== 'production') {
         console.log('[dmosh-export-service] ffmpeg start', { id: job.id, cmdLine });
       }
     })
     .on('progress', (progress) => {
-      const jobRef = JOBS.get(job.id);
-      if (!jobRef) {
+      if (!JOBS.has(job.id)) {
         try {
           command.kill('SIGKILL');
         } catch (_) {}
@@ -265,9 +371,9 @@ function startStubRender(job, project, settings) {
 
       const pct = typeof progress.percent === 'number'
         ? progress.percent
-        : Math.min(99, jobRef.progress + 1);
+        : Math.min(99, job.progress + 1);
 
-      jobRef.progress = Math.max(jobRef.progress, Math.min(100, Math.round(pct)));
+      job.progress = Math.max(job.progress, Math.min(100, Math.round(pct)));
     })
     .on('error', (err) => {
       job.status = 'failed';
@@ -288,19 +394,54 @@ function startStubRender(job, project, settings) {
       } catch (_) {}
 
       logMemory(`job ${job.id} end`);
+
+      try {
+        if (typeof onDone === 'function') {
+          onDone();
+        }
+      } catch (_) {}
     })
     .on('end', () => {
       job.status = 'complete';
       job.progress = 100;
 
       if (process.env.NODE_ENV !== 'production') {
-        console.log('[dmosh-export-service] ffmpeg complete', { id: job.id, outputPath });
+        console.log('[dmosh-export-service] ffmpeg complete', { id: job.id, outputPath, usingRealContent });
       }
 
       logMemory(`job ${job.id} end`);
       pruneOldJobs();
+
+      try {
+        if (typeof onDone === 'function') {
+          onDone();
+        }
+      } catch (_) {}
     })
     .save(outputPath);
+}
+
+function tryStartQueuedJobs(projectLookup) {
+  if (activeRenders >= MAX_CONCURRENT_FFMPEG) return;
+
+  for (const job of JOBS.values()) {
+    if (job.status === 'queued' && !job._started) {
+      job._started = true;
+      activeRenders += 1;
+
+      const onDone = () => {
+        activeRenders = Math.max(0, activeRenders - 1);
+        if (createJob._projects) {
+          createJob._projects.delete(job.id);
+        }
+        tryStartQueuedJobs(projectLookup);
+      };
+
+      const { project, settings } = projectLookup(job.id);
+      startRender(job, project || {}, settings || {}, onDone);
+      break;
+    }
+  }
 }
 
 function createJob({ project, settings, clientVersion }) {
@@ -321,7 +462,14 @@ function createJob({ project, settings, clientVersion }) {
 
   JOBS.set(id, job);
 
-  setImmediate(() => startStubRender(job, project || {}, safeSettings));
+  if (!createJob._projects) {
+    createJob._projects = new Map();
+  }
+  createJob._projects.set(id, { project: project || {}, settings: safeSettings });
+
+  setImmediate(() => {
+    tryStartQueuedJobs((jobId) => createJob._projects.get(jobId) || { project: {}, settings: safeSettings });
+  });
 
   return job;
 }
