@@ -14,6 +14,18 @@ if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
+// Safety caps for stub rendering (can be relaxed/removed later)
+const MAX_WIDTH = 1920;          // max output width for stub
+const MAX_HEIGHT = 1080;         // max output height for stub
+const MAX_FPS = 60;              // max fps for stub
+const MAX_DURATION_SECONDS = 60; // max duration (seconds) for stub
+
+function approxUncompressedGB(width, height, fps, seconds, bytesPerPixel = 4) {
+  const frames = fps * seconds;
+  const bytes = width * height * frames * bytesPerPixel;
+  return bytes / (1024 * 1024 * 1024);
+}
+
 function logMemory(label) {
   if (process.env.NODE_ENV === 'production') return;
   const m = process.memoryUsage();
@@ -43,10 +55,13 @@ function deriveRenderParams(project, settings) {
   width = Math.max(16, Math.round(width * scale));
   height = Math.max(16, Math.round(height * scale));
 
-  if (settings.videoCodec === 'h264' || settings.videoCodec === 'h265') {
-    if (width % 2 !== 0) width += 1;
-    if (height % 2 !== 0) height += 1;
-  }
+  // Keep copies before clamping
+  const unclampedWidth = width;
+  const unclampedHeight = height;
+
+  // Clamp to safety caps
+  width = Math.min(width, MAX_WIDTH);
+  height = Math.min(height, MAX_HEIGHT);
 
   const projectFps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
   let fps = projectFps;
@@ -55,8 +70,45 @@ function deriveRenderParams(project, settings) {
     fps = settings.fps;
   }
 
+  // Guard against bad fps values
+  if (!Number.isFinite(fps) || fps <= 0) {
+    fps = 24;
+  }
+
+  const unclampedFps = fps;
+  fps = Math.min(fps, MAX_FPS);
+
   const durationFrames = computeDurationFrames(project, settings);
-  const durationSeconds = Math.max(0.1, durationFrames / fps);
+  let durationSeconds = durationFrames / fps;
+
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    durationSeconds = 1;
+  }
+
+  const unclampedDurationSeconds = durationSeconds;
+  durationSeconds = Math.min(durationSeconds, MAX_DURATION_SECONDS);
+
+  if (process.env.NODE_ENV !== 'production') {
+    const approxGB = approxUncompressedGB(width, height, fps, durationSeconds);
+    console.log('[dmosh-export-service] deriveRenderParams', {
+      projectWidth,
+      projectHeight,
+      projectFps,
+      settingsWidth: settings.width,
+      settingsHeight: settings.height,
+      scale,
+      unclampedWidth,
+      unclampedHeight,
+      width,
+      height,
+      unclampedFps,
+      fps,
+      durationFrames,
+      unclampedDurationSeconds,
+      durationSeconds,
+      approxUncompressedGB: approxGB.toFixed(3),
+    });
+  }
 
   return { width, height, fps, durationSeconds };
 }
@@ -66,39 +118,54 @@ function computeDurationFrames(project, settings) {
 
   const ensureMinFrames = (frames) => Math.max(1, frames || 0);
 
+  let frames;
+
   if (source.kind === 'timeline') {
     if (typeof source.inFrame === 'number' && typeof source.outFrame === 'number') {
-      return ensureMinFrames(source.outFrame - source.inFrame + 1);
+      frames = ensureMinFrames(source.outFrame - source.inFrame + 1);
+    } else {
+      const clips = project?.timeline?.clips ?? [];
+      if (clips.length > 0) {
+        const minStart = Math.min(...clips.map((c) => c.timelineStartFrame));
+        const maxEnd = Math.max(
+          ...clips.map((c) => c.timelineStartFrame + (c.endFrame - c.startFrame)),
+        );
+        frames = ensureMinFrames(maxEnd - minStart + 1);
+      } else {
+        const fps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
+        frames = ensureMinFrames(fps);
+      }
     }
-
-    const clips = project?.timeline?.clips ?? [];
-    if (clips.length > 0) {
-      const minStart = Math.min(...clips.map((c) => c.timelineStartFrame));
-      const maxEnd = Math.max(...clips.map((c) => c.timelineStartFrame + (c.endFrame - c.startFrame)));
-      return ensureMinFrames(maxEnd - minStart + 1);
-    }
-
-    const fps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
-    return ensureMinFrames(fps);
-  }
-
-  if (source.kind === 'clip' && source.clipId && project?.timeline?.clips) {
+  } else if (source.kind === 'clip' && source.clipId && project?.timeline?.clips) {
     const clips = project.timeline.clips;
     const clip = clips.find((c) => c.id === source.clipId);
     if (clip) {
-      return ensureMinFrames(clip.endFrame - clip.startFrame + 1);
+      frames = ensureMinFrames(clip.endFrame - clip.startFrame + 1);
     }
-  }
-
-  if (source.kind === 'source' && source.sourceId && project?.sources) {
+  } else if (source.kind === 'source' && source.sourceId && project?.sources) {
     const src = project.sources.find((s) => s.id === source.sourceId);
     if (src?.durationFrames) {
-      return ensureMinFrames(src.durationFrames);
+      frames = ensureMinFrames(src.durationFrames);
     }
   }
 
-  const fps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
-  return ensureMinFrames(fps);
+  if (!frames) {
+    const fps = project?.timeline?.fps ?? project?.settings?.fps ?? 24;
+    frames = ensureMinFrames(fps);
+  }
+
+  if (process.env.NODE_ENV !== 'production') {
+    if (frames > 60 * 60 * 60) { // > 1 hour at 60fps
+      console.warn('[dmosh-export-service] computeDurationFrames: unusually large frame count', {
+        frames,
+        source,
+      });
+    } else {
+      console.log('[dmosh-export-service] computeDurationFrames', { frames, source });
+    }
+  }
+
+  return frames;
 }
 
 function mapVideoCodec(videoCodec, container) {
@@ -188,15 +255,19 @@ function startStubRender(job, project, settings) {
       }
     })
     .on('progress', (progress) => {
-      if (!JOBS.has(job.id)) {
+      const jobRef = JOBS.get(job.id);
+      if (!jobRef) {
         try {
           command.kill('SIGKILL');
         } catch (_) {}
         return;
       }
 
-      const pct = typeof progress.percent === 'number' ? progress.percent : Math.min(99, job.progress + 1);
-      job.progress = Math.max(job.progress, Math.min(100, Math.round(pct)));
+      const pct = typeof progress.percent === 'number'
+        ? progress.percent
+        : Math.min(99, jobRef.progress + 1);
+
+      jobRef.progress = Math.max(jobRef.progress, Math.min(100, Math.round(pct)));
     })
     .on('error', (err) => {
       job.status = 'failed';
