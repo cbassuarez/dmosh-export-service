@@ -535,12 +535,18 @@ function startRenderJob(job, project, settings) {
     command.setDuration(clipDurationSeconds);
   }
 
-  if (canCopy && startSeconds === null && clipDurationSeconds === null) {
-    command.outputOptions(['-c copy']);
-    if (safeSettings.includeAudio === false || audioCodec === 'none') {
-      command.noAudio();
-    }
-  } else {
+    if (canCopy && startSeconds === null && clipDurationSeconds === null) {
+        // Fast path: copy video stream, but transcode audio so the MP4 muxer
+        // never chokes on unsupported PCM variants (like pcm_s24le).
+        command.outputOptions(['-c:v copy']);
+    
+        if (safeSettings.includeAudio === false || audioCodec === 'none') {
+          command.noAudio();
+        } else {
+          // Re-encode audio to a container-safe codec (defaults to AAC).
+          command.audioCodec(audioCodec);
+        }
+      } else {
     command.videoCodec(videoCodec);
 
     const pixelFormat = safeSettings.pixelFormat || 'yuv420p';
