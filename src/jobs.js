@@ -21,6 +21,17 @@ const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS || 1);
 const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
 const RUNNING_JOBS = new Set();
 const QUEUE = [];
+const IS_DEV = process.env.NODE_ENV !== 'production';
+
+function debugLog(label, payload) {
+  if (!IS_DEV) return;
+  console.log('[dmosh-export-service]', label, payload);
+}
+
+function debugError(label, payload) {
+  if (!IS_DEV) return;
+  console.error('[dmosh-export-service]', label, payload);
+}
 
 const SOFT_MAX_WIDTH = 3840;
 const SOFT_MAX_HEIGHT = 2160;
@@ -351,34 +362,70 @@ function startRenderJob(job, project, settings) {
     RUNNING_JOBS.delete(job.id);
     pruneOldJobs();
     scheduleNext();
+      debugError('unsupported_timeline', {
+        jobId: job.id,
+        source: safeSettings.source || null,
+        clipCount: project?.timeline?.clips?.length ?? 0,
+        trackCount: project?.timeline?.tracks?.length ?? 0,
+      });
     return;
   }
 
-  const primarySource = resolvePrimarySource(project, safeSettings);
-  const inputPath = resolveMediaPathForSource(project, primarySource, container);
+    const primarySource = resolvePrimarySource(project, safeSettings);
+    const inputPath = resolveMediaPathForSource(project, primarySource, container);
 
-  if (!primarySource || !inputPath) {
-    job.status = 'failed';
-    job.error = 'media_missing';
-    job.progress = 0;
-    job.downloadPath = null;
-    RUNNING_JOBS.delete(job.id);
-    pruneOldJobs();
-    scheduleNext();
-    return;
-  }
+    if (!primarySource || !inputPath) {
+      debugError('media_missing', {
+        jobId: job.id,
+        container,
+        primarySource: primarySource
+          ? {
+              id: primarySource.id,
+              originalName: primarySource.originalName,
+              hash: primarySource.hash,
+            }
+          : null,
+        candidates: primarySource
+          ? getMediaCandidatePaths({
+              hash: primarySource.hash,
+              originalName: primarySource.originalName,
+              container,
+            })
+          : [],
+      });
+
+      job.status = 'failed';
+      job.error = 'media_missing';
+      job.progress = 0;
+      job.downloadPath = null;
+      RUNNING_JOBS.delete(job.id);
+      pruneOldJobs();
+      scheduleNext();
+      return;
+    }
 
   const { width, height, fps, durationSeconds } = deriveRenderParams(project, safeSettings);
 
-  if (width > EXTREME_MAX_DIMENSION || height > EXTREME_MAX_DIMENSION || durationSeconds > EXTREME_MAX_DURATION_SECONDS) {
-    job.status = 'failed';
-    job.error = 'job_too_large';
-    job.downloadPath = null;
-    RUNNING_JOBS.delete(job.id);
-    pruneOldJobs();
-    scheduleNext();
-    return;
-  }
+    if (width > EXTREME_MAX_DIMENSION || height > EXTREME_MAX_DIMENSION || durationSeconds > EXTREME_MAX_DURATION_SECONDS) {
+      debugError('job_too_large', {
+        jobId: job.id,
+        width,
+        height,
+        fps,
+        durationSeconds,
+        EXTREME_MAX_DIMENSION,
+        EXTREME_MAX_DURATION_SECONDS,
+        approxUncompressedGB: approxUncompressedGB(width, height, fps, durationSeconds).toFixed(3),
+      });
+
+      job.status = 'failed';
+      job.error = 'job_too_large';
+      job.downloadPath = null;
+      RUNNING_JOBS.delete(job.id);
+      pruneOldJobs();
+      scheduleNext();
+      return;
+    }
 
   if (width > SOFT_MAX_WIDTH || height > SOFT_MAX_HEIGHT) {
     console.warn('[dmosh-export-service] large resolution requested', { id: job.id, width, height });
@@ -418,7 +465,7 @@ function startRenderJob(job, project, settings) {
   logMemory(`job ${job.id} start`);
 
   const command = ffmpeg(inputPath);
-
+    let lastFfmpegCommandLine = null;
   const sourceRef = safeSettings.source || { kind: 'timeline' };
   let startSeconds = null;
   let clipDurationSeconds = null;
@@ -482,8 +529,22 @@ function startRenderJob(job, project, settings) {
 
   command
     .on('start', (cmdLine) => {
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('[dmosh-export-service] ffmpeg start', { id: job.id, cmdLine });
+      lastFfmpegCommandLine = cmdLine;
+      if (IS_DEV) {
+        debugLog('ffmpeg_start', {
+          jobId: job.id,
+          cmdLine,
+          inputPath,
+          outputPath,
+          container,
+          width,
+          height,
+          fps,
+          durationSeconds,
+          videoCodec,
+          audioCodec,
+          canCopy,
+        });
       }
     })
     .on('progress', (progress) => {
@@ -496,14 +557,19 @@ function startRenderJob(job, project, settings) {
       const pct = typeof progress.percent === 'number' ? progress.percent : Math.min(99, job.progress + 1);
       job.progress = Math.max(job.progress, Math.min(100, Math.round(pct)));
     })
-    .on('error', (err) => {
+    .on('error', (err, stdout, stderr) => {
       job.status = 'failed';
-      job.error = err?.message || 'ffmpeg_error';
+      job.error = err?.code || err?.message || 'ffmpeg_error';
       job.progress = 0;
 
-      if (process.env.NODE_ENV !== 'production') {
-        console.error('[dmosh-export-service] ffmpeg error', { id: job.id, error: job.error });
-      }
+      debugError('ffmpeg_error', {
+        jobId: job.id,
+        errorMessage: err?.message,
+        errorCode: err?.code,
+        ffmpegCommand: lastFfmpegCommandLine,
+        stdout: stdout && stdout.slice ? stdout.slice(0, 2000) : stdout,
+        stderr: stderr && stderr.slice ? stderr.slice(0, 2000) : stderr,
+      });
 
       try {
         if (fs.existsSync(outputPath)) {
@@ -521,9 +587,7 @@ function startRenderJob(job, project, settings) {
       job.status = 'complete';
       job.progress = 100;
 
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('[dmosh-export-service] ffmpeg complete', { id: job.id, outputPath });
-      }
+      debugLog('ffmpeg_complete', { jobId: job.id, outputPath });
 
       logMemory(`job ${job.id} end`);
 
@@ -551,6 +615,13 @@ function createJob({ project, settings, clientVersion }) {
   };
 
   JOBS.set(id, job);
+    debugLog('create_job', {
+      jobId: id,
+      container: job.container,
+      clientVersion,
+      runningJobs: RUNNING_JOBS.size,
+      queueLength: QUEUE.length,
+    });
 
   if (RUNNING_JOBS.size < MAX_CONCURRENT_JOBS) {
     setImmediate(() => startRenderJob(job, project || {}, safeSettings));
