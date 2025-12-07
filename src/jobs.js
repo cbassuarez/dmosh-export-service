@@ -459,13 +459,12 @@ function startRenderJob(job, project, settings) {
   const videoCodec = mapVideoCodec(safeSettings.videoCodec, container);
   const audioCodec = mapAudioCodec(safeSettings.audioCodec);
 
-  const canCopy =
-    container === 'mp4' &&
-    (safeSettings.videoCodec === 'h264' || !safeSettings.videoCodec) &&
-    (safeSettings.audioCodec === 'aac' || !safeSettings.audioCodec) &&
-    safeSettings.renderResolutionScale === 1 &&
-    safeSettings.outputResolution !== 'custom' &&
-    safeSettings.fpsMode === 'project';
+    // NOTE, IMPORTANT: Disable fast-path stream copy for now. The previous logic
+      // only looked at *desired* output settings, not the *actual* input
+      // codecs, which caused invalid MP4s (e.g. pcm_s24le in mp4) and
+      // ffmpeg header failures. We can re-enable a smarter copy path
+      // later by probing the input streams.
+      const canCopy = false;
 
   pushJobDebug(job, 'ffmpeg_start', {
     container,
