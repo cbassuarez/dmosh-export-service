@@ -23,14 +23,14 @@ router.get('/:id', (req, res) => {
     return res.status(404).json({ error: 'not_found' });
   }
 
-  return res.json({
-    id: job.id,
-    status: job.status,
-    progress: typeof job.progress === 'number' ? job.progress : null,
-    error: job.error,
-    downloadUrl: job.downloadPath ? `/exports/${job.id}/download` : null,
-    debug: IS_DEV ? job.debug || [] : undefined,
-  });
+    return res.json({
+      id: job.id,
+      status: job.status,
+      error: job.error || null,
+      progress: job.progress ?? 0,
+      // expose backend debug trail to the client
+      debug: Array.isArray(job.debug) ? job.debug : [],
+    });
 });
 
 router.get('/:id/download', (req, res) => {
