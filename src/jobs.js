@@ -9,12 +9,18 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 const JOBS = new Map();
 const TMP_DIR = path.join(os.tmpdir(), 'dmosh-export-service');
-const MAX_CONCURRENT_FFMPEG = parseInt(process.env.MAX_CONCURRENT_FFMPEG || '2', 10);
-let activeRenders = 0;
-
+const MEDIA_ROOT = process.env.MEDIA_ROOT || path.join(os.tmpdir(), 'dmosh-media');
 if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
+if (!fs.existsSync(MEDIA_ROOT)) {
+  fs.mkdirSync(MEDIA_ROOT, { recursive: true });
+}
+
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS || 1);
+const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH || 20);
+const RUNNING_JOBS = new Set();
+const QUEUE = [];
 
 const SOFT_MAX_WIDTH = 3840;
 const SOFT_MAX_HEIGHT = 2160;
@@ -28,54 +34,6 @@ function approxUncompressedGB(width, height, fps, seconds, bytesPerPixel = 4) {
   return bytes / (1024 * 1024 * 1024);
 }
 
-function resolveSourcePathFromProject(project, settings) {
-  const mediaRoot = process.env.MEDIA_ROOT || process.cwd();
-  const source = settings.source || { kind: 'timeline' };
-
-  let sourceObj = null;
-
-  if (source.kind === 'source' && source.sourceId && Array.isArray(project?.sources)) {
-    sourceObj = project.sources.find((s) => s.id === source.sourceId) || null;
-  } else if (source.kind === 'clip' && source.clipId && Array.isArray(project?.timeline?.clips)) {
-    const clip = project.timeline.clips.find((c) => c.id === source.clipId);
-    if (clip && Array.isArray(project.sources)) {
-      sourceObj = project.sources.find((s) => s.id === clip.sourceId) || null;
-    }
-  } else if (source.kind === 'timeline' && Array.isArray(project?.timeline?.clips) && project.timeline.clips.length === 1) {
-    const clip = project.timeline.clips[0];
-    if (Array.isArray(project.sources)) {
-      sourceObj = project.sources.find((s) => s.id === clip.sourceId) || null;
-    }
-  }
-
-  if (!sourceObj) {
-    return null;
-  }
-
-  const originalName = sourceObj.originalName || '';
-  const extFromName = path.extname(originalName) || '.mp4';
-  const hash = sourceObj.hash || '';
-
-  const candidates = [];
-
-  if (hash) {
-    candidates.push(path.join(mediaRoot, `${hash}${extFromName}`));
-    candidates.push(path.join(mediaRoot, hash));
-  }
-
-  if (originalName) {
-    candidates.push(path.join(mediaRoot, originalName));
-  }
-
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
 function logMemory(label) {
   if (process.env.NODE_ENV === 'production') return;
   const m = process.memoryUsage();
@@ -85,6 +43,108 @@ function logMemory(label) {
     heapUsed: m.heapUsed,
     external: m.external,
   });
+}
+
+function safeBaseName(name) {
+  if (!name) return null;
+  return path.basename(name).replace(/[^a-zA-Z0-9_.-]/g, '_');
+}
+
+function getMediaCandidatePaths({ hash, originalName, container }) {
+  const paths = [];
+  const safeName = safeBaseName(originalName);
+  const base = path.join(MEDIA_ROOT, hash || '');
+
+  const preferredExts = [];
+  if (container) preferredExts.push(container);
+  preferredExts.push('mp4', 'mov', 'mkv', 'webm');
+
+  if (hash) {
+    for (const ext of preferredExts) {
+      paths.push(`${base}.${ext}`);
+    }
+    paths.push(base);
+  }
+
+  if (safeName) {
+    paths.push(path.join(MEDIA_ROOT, safeName));
+  }
+
+  return paths;
+}
+
+function resolveMediaPathForSource(project, sourceRef, container) {
+  if (!sourceRef) return null;
+
+  const hash = sourceRef.hash;
+  const originalName = sourceRef.originalName;
+
+  if (!hash && !originalName) {
+    return null;
+  }
+
+  const candidates = getMediaCandidatePaths({ hash, originalName, container });
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).size > 0) {
+        return candidate;
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+  return null;
+}
+
+function resolvePrimarySource(project, settings) {
+  const sourceRef = settings.source || { kind: 'timeline' };
+
+  const sources = project?.sources || [];
+  const clips = project?.timeline?.clips || [];
+
+  if (sourceRef.kind === 'source' && sourceRef.sourceId) {
+    return sources.find((s) => s.id === sourceRef.sourceId) || null;
+  }
+
+  if (sourceRef.kind === 'clip' && sourceRef.clipId) {
+    const clip = clips.find((c) => c.id === sourceRef.clipId);
+    if (!clip) return null;
+    return sources.find((s) => s.id === clip.sourceId) || null;
+  }
+
+  if (clips.length === 0) return null;
+
+  const sourceIds = new Set(clips.map((c) => c.sourceId).filter(Boolean));
+  if (sourceIds.size !== 1) {
+    return null;
+  }
+  const [onlySourceId] = Array.from(sourceIds);
+  return sources.find((s) => s.id === onlySourceId) || null;
+}
+
+function isSimpleTimeline(project, settings) {
+  const sourceRef = settings.source || { kind: 'timeline' };
+  if (sourceRef.kind !== 'timeline') return true;
+
+  const clips = project?.timeline?.clips || [];
+  if (clips.length === 0) return true;
+
+  const sourceIds = new Set(clips.map((c) => c.sourceId).filter(Boolean));
+  if (sourceIds.size !== 1) {
+    return false;
+  }
+
+  const sorted = [...clips].sort((a, b) => (a.timelineStartFrame || 0) - (b.timelineStartFrame || 0));
+  for (let i = 1; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1];
+    const prevEnd = (prev.timelineStartFrame || 0) + (prev.endFrame - prev.startFrame);
+    const currentStart = sorted[i].timelineStartFrame || 0;
+    if (currentStart < prevEnd) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function deriveRenderParams(project, settings) {
@@ -112,7 +172,6 @@ function deriveRenderParams(project, settings) {
     fps = settings.fps;
   }
 
-  // Guard against bad fps values
   if (!Number.isFinite(fps) || fps <= 0) {
     fps = 24;
   }
@@ -183,7 +242,7 @@ function computeDurationFrames(project, settings) {
   }
 
   if (process.env.NODE_ENV !== 'production') {
-    if (frames > 60 * 60 * 60) { // > 1 hour at 60fps
+    if (frames > 60 * 60 * 60) {
       console.warn('[dmosh-export-service] computeDurationFrames: unusually large frame count', {
         frames,
         source,
@@ -216,6 +275,21 @@ function mapVideoCodec(videoCodec, container) {
   }
 }
 
+function mapAudioCodec(audioCodec) {
+  switch (audioCodec) {
+    case 'aac':
+      return 'aac';
+    case 'pcm_s16le':
+      return 'pcm_s16le';
+    case 'opus':
+      return 'libopus';
+    case 'none':
+      return 'none';
+    default:
+      return 'aac';
+  }
+}
+
 function pruneOldJobs() {
   const now = Date.now();
   const MAX_AGE_MS = 60 * 60 * 1000;
@@ -232,8 +306,79 @@ function pruneOldJobs() {
   }
 }
 
-function startRender(job, project, settings, onDone) {
-  const { width, height, fps, durationSeconds } = deriveRenderParams(project, settings);
+function scheduleNext() {
+  if (RUNNING_JOBS.size >= MAX_CONCURRENT_JOBS) return;
+  if (QUEUE.length === 0) return;
+
+  const next = QUEUE.shift();
+  if (!next) return;
+
+  const { jobId, project, settings } = next;
+  const job = JOBS.get(jobId);
+  if (!job) {
+    scheduleNext();
+    return;
+  }
+
+  startRenderJob(job, project, settings);
+}
+
+function startRenderJob(job, project, settings) {
+  RUNNING_JOBS.add(job.id);
+
+  const safeSettings = settings || {};
+  const container = safeSettings.container || 'mp4';
+  const outputPath = path.join(TMP_DIR, `${job.id}.${container}`);
+
+  job.status = 'rendering';
+  job.progress = 0;
+  job.error = null;
+  job.downloadPath = outputPath;
+
+  try {
+    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+  } catch (e) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('Failed to remove existing file before render', outputPath, e);
+    }
+  }
+
+  if (!isSimpleTimeline(project, safeSettings)) {
+    job.status = 'failed';
+    job.error = 'unsupported_timeline';
+    job.progress = 0;
+    job.downloadPath = null;
+    RUNNING_JOBS.delete(job.id);
+    pruneOldJobs();
+    scheduleNext();
+    return;
+  }
+
+  const primarySource = resolvePrimarySource(project, safeSettings);
+  const inputPath = resolveMediaPathForSource(project, primarySource, container);
+
+  if (!primarySource || !inputPath) {
+    job.status = 'failed';
+    job.error = 'media_missing';
+    job.progress = 0;
+    job.downloadPath = null;
+    RUNNING_JOBS.delete(job.id);
+    pruneOldJobs();
+    scheduleNext();
+    return;
+  }
+
+  const { width, height, fps, durationSeconds } = deriveRenderParams(project, safeSettings);
+
+  if (width > EXTREME_MAX_DIMENSION || height > EXTREME_MAX_DIMENSION || durationSeconds > EXTREME_MAX_DURATION_SECONDS) {
+    job.status = 'failed';
+    job.error = 'job_too_large';
+    job.downloadPath = null;
+    RUNNING_JOBS.delete(job.id);
+    pruneOldJobs();
+    scheduleNext();
+    return;
+  }
 
   if (width > SOFT_MAX_WIDTH || height > SOFT_MAX_HEIGHT) {
     console.warn('[dmosh-export-service] large resolution requested', { id: job.id, width, height });
@@ -243,116 +388,96 @@ function startRender(job, project, settings, onDone) {
     console.warn('[dmosh-export-service] long duration requested', { id: job.id, durationSeconds });
   }
 
-  if (width > EXTREME_MAX_DIMENSION || height > EXTREME_MAX_DIMENSION || durationSeconds > EXTREME_MAX_DURATION_SECONDS) {
-    job.status = 'failed';
-    job.error = 'job_too_large';
-    if (typeof onDone === 'function') {
-      onDone();
-    }
-    return;
-  }
+  const videoCodec = mapVideoCodec(safeSettings.videoCodec, container);
+  const audioCodec = mapAudioCodec(safeSettings.audioCodec);
 
-  const container = settings.container || 'mp4';
-  const outputPath = path.join(TMP_DIR, `${job.id}.${container}`);
-
-  job.status = 'rendering';
-  job.progress = 0;
-  job.error = null;
-  job.downloadPath = outputPath;
-
-  const codec = mapVideoCodec(settings.videoCodec, container);
-  const pixelFormat = settings.pixelFormat || 'yuv420p';
-  const inputPath = resolveSourcePathFromProject(project, settings);
-
-  let command;
-  let usingRealContent = false;
+  const canCopy =
+    container === 'mp4' &&
+    (safeSettings.videoCodec === 'h264' || !safeSettings.videoCodec) &&
+    (safeSettings.audioCodec === 'aac' || !safeSettings.audioCodec) &&
+    safeSettings.renderResolutionScale === 1 &&
+    safeSettings.outputResolution !== 'custom' &&
+    safeSettings.fpsMode === 'project';
 
   if (process.env.NODE_ENV !== 'production') {
     console.log('[dmosh-export-service] starting render', {
       id: job.id,
+      container,
+      inputPath,
+      outputPath,
       width,
       height,
       fps,
       durationSeconds,
-      container,
-      codec,
-      inputPath,
-      outputPath,
+      videoCodec,
+      audioCodec,
+      canCopy,
     });
-  }
-
-  try {
-    if (fs.existsSync(outputPath)) {
-      fs.unlinkSync(outputPath);
-    }
-  } catch (e) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.warn('Failed to remove existing file before render', outputPath, e);
-    }
   }
 
   logMemory(`job ${job.id} start`);
 
-  if (inputPath) {
-    usingRealContent = true;
-    const source = settings.source || { kind: 'timeline' };
+  const command = ffmpeg(inputPath);
 
-    command = ffmpeg(inputPath);
+  const sourceRef = safeSettings.source || { kind: 'timeline' };
+  let startSeconds = null;
+  let clipDurationSeconds = null;
 
-    const needsScale =
-      settings.outputResolution === 'custom' ||
-      (width !== project?.settings?.width || height !== project?.settings?.height);
-
-    if (needsScale) {
-      command = command.videoFilters(`scale=${width}:${height}`);
+  if (sourceRef.kind === 'clip' && sourceRef.clipId && Array.isArray(project?.timeline?.clips)) {
+    const clip = project.timeline.clips.find((c) => c.id === sourceRef.clipId);
+    if (clip) {
+      startSeconds = (clip.startFrame || 0) / fps;
+      clipDurationSeconds = Math.max(0.1, (clip.endFrame - clip.startFrame + 1) / fps);
     }
+  } else if (sourceRef.kind === 'timeline' && typeof sourceRef.inFrame === 'number' && typeof sourceRef.outFrame === 'number') {
+    startSeconds = sourceRef.inFrame / fps;
+    clipDurationSeconds = Math.max(0.1, (sourceRef.outFrame - sourceRef.inFrame + 1) / fps);
+  }
 
-    let effectiveFps = fps;
-    if (settings.fpsMode === 'override' && settings.fps) {
-      effectiveFps = settings.fps;
-    }
+  const needsScale =
+    safeSettings.outputResolution === 'custom' ||
+    (width !== project?.settings?.width || height !== project?.settings?.height) ||
+    safeSettings.renderResolutionScale !== 1;
 
-    if (effectiveFps && typeof effectiveFps === 'number') {
-      command = command.outputOptions(['-r', String(effectiveFps)]);
-    }
+  if (needsScale) {
+    command.videoFilters(`scale=${width}:${height}`);
+  }
 
-    if (source.kind === 'timeline' && typeof source.inFrame === 'number' && typeof source.outFrame === 'number') {
-      const inSec = source.inFrame / fps;
-      const outSec = source.outFrame / fps;
-      command = command.setStartTime(inSec).outputOptions(['-t', String(Math.max(0.1, outSec - inSec))]);
-    }
+  if (safeSettings.fpsMode === 'override' && safeSettings.fps) {
+    command.outputOptions(['-r', String(safeSettings.fps)]);
+  }
 
-    const canCopyVideo =
-      settings.outputResolution !== 'custom' &&
-      !needsScale &&
-      settings.fpsMode === 'project' &&
-      (settings.rateControl?.mode === 'bitrate' || settings.rateControl?.mode === 'crf') &&
-      (settings.videoCodec === 'h264' || !settings.videoCodec) &&
-      (container === 'mp4' || container === 'mkv' || container === 'mov');
+  if (startSeconds !== null) {
+    command.setStartTime(startSeconds);
+  }
+  if (clipDurationSeconds !== null) {
+    command.setDuration(clipDurationSeconds);
+  }
 
-    if (canCopyVideo) {
-      command = command.videoCodec('copy');
-      if (settings.includeAudio && settings.audioCodec && settings.audioCodec !== 'none') {
-        command = command.audioCodec('copy');
-      } else {
-        command = command.noAudio();
-      }
-    } else {
-      command = command.videoCodec(codec).outputOptions(['-pix_fmt', pixelFormat]);
-
-      if (settings.includeAudio && settings.audioCodec && settings.audioCodec !== 'none') {
-        command = command.audioCodec(settings.audioCodec);
-      } else {
-        command = command.noAudio();
-      }
+  if (canCopy && startSeconds === null && clipDurationSeconds === null) {
+    command.outputOptions(['-c copy']);
+    if (safeSettings.includeAudio === false || audioCodec === 'none') {
+      command.noAudio();
     }
   } else {
-    const input = `color=c=black:s=${width}x${height}:r=${fps}:d=${durationSeconds}`;
-    command = ffmpeg(input)
-      .inputFormat('lavfi')
-      .videoCodec(codec)
-      .outputOptions(['-pix_fmt', pixelFormat])
-      .noAudio();
+    command.videoCodec(videoCodec);
+
+    const pixelFormat = safeSettings.pixelFormat || 'yuv420p';
+    const outputOptions = [`-pix_fmt ${pixelFormat}`];
+
+    if (safeSettings.rateControl?.mode === 'crf' && typeof safeSettings.rateControl.value === 'number') {
+      outputOptions.push(`-crf ${safeSettings.rateControl.value}`);
+    } else if (safeSettings.rateControl?.mode === 'bitrate' && typeof safeSettings.rateControl.kbps === 'number') {
+      outputOptions.push(`-b:v ${safeSettings.rateControl.kbps}k`);
+    }
+
+    if (audioCodec === 'none' || safeSettings.includeAudio === false) {
+      command.noAudio();
+    } else {
+      command.audioCodec(audioCodec);
+    }
+
+    command.outputOptions(outputOptions);
   }
 
   command
@@ -368,11 +493,7 @@ function startRender(job, project, settings, onDone) {
         } catch (_) {}
         return;
       }
-
-      const pct = typeof progress.percent === 'number'
-        ? progress.percent
-        : Math.min(99, job.progress + 1);
-
+      const pct = typeof progress.percent === 'number' ? progress.percent : Math.min(99, job.progress + 1);
       job.progress = Math.max(job.progress, Math.min(100, Math.round(pct)));
     })
     .on('error', (err) => {
@@ -381,10 +502,7 @@ function startRender(job, project, settings, onDone) {
       job.progress = 0;
 
       if (process.env.NODE_ENV !== 'production') {
-        console.error('[dmosh-export-service] ffmpeg error', {
-          id: job.id,
-          error: job.error,
-        });
+        console.error('[dmosh-export-service] ffmpeg error', { id: job.id, error: job.error });
       }
 
       try {
@@ -395,53 +513,25 @@ function startRender(job, project, settings, onDone) {
 
       logMemory(`job ${job.id} end`);
 
-      try {
-        if (typeof onDone === 'function') {
-          onDone();
-        }
-      } catch (_) {}
+      RUNNING_JOBS.delete(job.id);
+      pruneOldJobs();
+      scheduleNext();
     })
     .on('end', () => {
       job.status = 'complete';
       job.progress = 100;
 
       if (process.env.NODE_ENV !== 'production') {
-        console.log('[dmosh-export-service] ffmpeg complete', { id: job.id, outputPath, usingRealContent });
+        console.log('[dmosh-export-service] ffmpeg complete', { id: job.id, outputPath });
       }
 
       logMemory(`job ${job.id} end`);
-      pruneOldJobs();
 
-      try {
-        if (typeof onDone === 'function') {
-          onDone();
-        }
-      } catch (_) {}
+      RUNNING_JOBS.delete(job.id);
+      pruneOldJobs();
+      scheduleNext();
     })
     .save(outputPath);
-}
-
-function tryStartQueuedJobs(projectLookup) {
-  if (activeRenders >= MAX_CONCURRENT_FFMPEG) return;
-
-  for (const job of JOBS.values()) {
-    if (job.status === 'queued' && !job._started) {
-      job._started = true;
-      activeRenders += 1;
-
-      const onDone = () => {
-        activeRenders = Math.max(0, activeRenders - 1);
-        if (createJob._projects) {
-          createJob._projects.delete(job.id);
-        }
-        tryStartQueuedJobs(projectLookup);
-      };
-
-      const { project, settings } = projectLookup(job.id);
-      startRender(job, project || {}, settings || {}, onDone);
-      break;
-    }
-  }
 }
 
 function createJob({ project, settings, clientVersion }) {
@@ -462,14 +552,15 @@ function createJob({ project, settings, clientVersion }) {
 
   JOBS.set(id, job);
 
-  if (!createJob._projects) {
-    createJob._projects = new Map();
+  if (RUNNING_JOBS.size < MAX_CONCURRENT_JOBS) {
+    setImmediate(() => startRenderJob(job, project || {}, safeSettings));
+  } else if (QUEUE.length < MAX_QUEUE_LENGTH) {
+    QUEUE.push({ jobId: id, project: project || {}, settings: safeSettings });
+  } else {
+    job.status = 'failed';
+    job.error = 'over_capacity';
+    job.progress = 0;
   }
-  createJob._projects.set(id, { project: project || {}, settings: safeSettings });
-
-  setImmediate(() => {
-    tryStartQueuedJobs((jobId) => createJob._projects.get(jobId) || { project: {}, settings: safeSettings });
-  });
 
   return job;
 }
@@ -483,4 +574,7 @@ module.exports = {
   getJob,
   deriveRenderParams,
   computeDurationFrames,
+  // exporting helpers for potential external use/testing
+  resolveMediaPathForSource,
+  getMediaCandidatePaths,
 };
