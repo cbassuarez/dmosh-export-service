@@ -315,6 +315,39 @@ function mapAudioCodec(audioCodec) {
   }
 }
 
+function buildDatamoshFilterChain(datamosh) {
+  const filters = [];
+  if (!datamosh || !datamosh.mode || datamosh.mode === 'none') return filters;
+
+  // Legacy / simple toggle
+  if (datamosh.mode === 'classic') {
+    // Rough classic effect: drop I-frames, smear across GOP
+    filters.push('select=not(eq(pict_type\\,I))');
+    filters.push('setpts=N/(FRAME_RATE*TB)');
+    return filters;
+  }
+
+  if (datamosh.mode === 'timeline') {
+    const ops = new Set(
+      Array.isArray(datamosh.operations) ? datamosh.operations : [],
+    );
+
+    // Treat ClassicDatamosh + DropIntraFrames as "drop I-frames"
+    if (ops.has('ClassicDatamosh') || ops.has('DropIntraFrames')) {
+      filters.push('select=not(eq(pict_type\\,I))');
+      filters.push('setpts=N/(FRAME_RATE*TB)');
+    } else if (ops.has('DropPredictedFrames')) {
+      // Simple "drop P-frames" preset
+      filters.push('select=not(eq(pict_type\\,P))');
+      filters.push('setpts=N/(FRAME_RATE*TB)');
+    }
+
+    // Other ops (HoldReferenceFrame, etc.) are preview-only for now
+  }
+
+  return filters;
+}
+
 function pruneOldJobs() {
   const now = Date.now();
   const MAX_AGE_MS = 60 * 60 * 1000;
@@ -352,6 +385,7 @@ function startRenderJob(job, project, settings) {
   RUNNING_JOBS.add(job.id);
 
   const safeSettings = settings || {};
+  const datamosh = safeSettings.datamosh || { mode: 'none' };
   const container = safeSettings.container || 'mp4';
   const outputPath = path.join(TMP_DIR, `${job.id}.${container}`);
 
@@ -466,22 +500,7 @@ function startRenderJob(job, project, settings) {
       // later by probing the input streams.
       const canCopy = false;
 
-  pushJobDebug(job, 'ffmpeg_start', {
-    container,
-    inputPath,
-    outputPath,
-    width,
-    height,
-    fps,
-    durationSeconds,
-    videoCodec,
-    audioCodec,
-    canCopy,
-  });
-
-  if (process.env.NODE_ENV !== 'production') {
-    console.log('[dmosh-export-service] starting render', {
-      id: job.id,
+    pushJobDebug(job, 'ffmpeg_start', {
       container,
       inputPath,
       outputPath,
@@ -492,8 +511,25 @@ function startRenderJob(job, project, settings) {
       videoCodec,
       audioCodec,
       canCopy,
+      datamosh,
     });
-  }
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[dmosh-export-service] starting render', {
+        id: job.id,
+        container,
+        inputPath,
+        outputPath,
+        width,
+        height,
+        fps,
+        durationSeconds,
+        videoCodec,
+        audioCodec,
+        canCopy,
+        datamosh,
+      });
+    }
 
   logMemory(`job ${job.id} start`);
 
@@ -514,14 +550,25 @@ function startRenderJob(job, project, settings) {
     clipDurationSeconds = Math.max(0.1, (sourceRef.outFrame - sourceRef.inFrame + 1) / fps);
   }
 
-  const needsScale =
-    safeSettings.outputResolution === 'custom' ||
-    (width !== project?.settings?.width || height !== project?.settings?.height) ||
-    safeSettings.renderResolutionScale !== 1;
+    const needsScale =
+      safeSettings.outputResolution === 'custom' ||
+      (width !== project?.settings?.width || height !== project?.settings?.height) ||
+      safeSettings.renderResolutionScale !== 1;
 
-  if (needsScale) {
-    command.videoFilters(`scale=${width}:${height}`);
-  }
+    const videoFilters = [];
+
+    if (needsScale) {
+      videoFilters.push(`scale=${width}:${height}`);
+    }
+
+    const datamoshFilters = buildDatamoshFilterChain(datamosh);
+    if (datamoshFilters.length > 0) {
+      videoFilters.push(...datamoshFilters);
+    }
+
+    if (videoFilters.length > 0) {
+      command.videoFilters(videoFilters);
+    }
 
   if (safeSettings.fpsMode === 'override' && safeSettings.fps) {
     command.outputOptions(['-r', String(safeSettings.fps)]);
