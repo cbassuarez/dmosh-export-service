@@ -1,5 +1,8 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 if (process.env.NODE_ENV !== 'production') {
   // Load environment variables from .env in non-production environments
@@ -10,6 +13,7 @@ if (process.env.NODE_ENV !== 'production') {
 const EXPORT_AUTH_TOKEN = process.env.EXPORT_AUTH_TOKEN;
 const CORS_ORIGIN = process.env.CORS_ORIGIN;
 const PORT = process.env.PORT || 4000;
+const MEDIA_ROOT = process.env.MEDIA_ROOT || path.join(os.tmpdir(), 'dmosh-media');
 
 if (!EXPORT_AUTH_TOKEN || !CORS_ORIGIN) {
   // eslint-disable-next-line no-console
@@ -17,7 +21,12 @@ if (!EXPORT_AUTH_TOKEN || !CORS_ORIGIN) {
   process.exit(1);
 }
 
+if (!fs.existsSync(MEDIA_ROOT)) {
+  fs.mkdirSync(MEDIA_ROOT, { recursive: true });
+}
+
 const exportsRouter = require('./exportsRoutes');
+const mediaRouter = require('./mediaRoutes');
 
 const app = express();
 
@@ -43,6 +52,7 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/exports', authMiddleware, exportsRouter);
+app.use('/media', authMiddleware, mediaRouter);
 
 app.use((err, req, res, next) => {
   // eslint-disable-next-line no-console
