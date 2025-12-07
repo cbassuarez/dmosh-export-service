@@ -33,6 +33,18 @@ function debugError(label, payload) {
   console.error('[dmosh-export-service]', label, payload);
 }
 
+function pushJobDebug(job, label, payload) {
+  if (!IS_DEV || !job) return;
+  if (!job.debug) job.debug = [];
+  // keep it bounded
+  if (job.debug.length > 50) job.debug.shift();
+  job.debug.push({
+    ts: new Date().toISOString(),
+    label,
+    payload,
+  });
+}
+
 const SOFT_MAX_WIDTH = 3840;
 const SOFT_MAX_HEIGHT = 2160;
 const SOFT_MAX_DURATION_SECONDS = 10 * 60;
@@ -374,6 +386,13 @@ function startRenderJob(job, project, settings) {
     const primarySource = resolvePrimarySource(project, safeSettings);
     const inputPath = resolveMediaPathForSource(project, primarySource, container);
 
+    pushJobDebug(job, 'resolve_media', {
+      sourceId: primarySource?.id || null,
+      hash: primarySource?.hash || null,
+      originalName: primarySource?.originalName || null,
+      inputPath,
+    });
+
     if (!primarySource || !inputPath) {
       debugError('media_missing', {
         jobId: job.id,
@@ -445,6 +464,19 @@ function startRenderJob(job, project, settings) {
     safeSettings.renderResolutionScale === 1 &&
     safeSettings.outputResolution !== 'custom' &&
     safeSettings.fpsMode === 'project';
+
+  pushJobDebug(job, 'ffmpeg_start', {
+    container,
+    inputPath,
+    outputPath,
+    width,
+    height,
+    fps,
+    durationSeconds,
+    videoCodec,
+    audioCodec,
+    canCopy,
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     console.log('[dmosh-export-service] starting render', {
@@ -571,6 +603,11 @@ function startRenderJob(job, project, settings) {
         stderr: stderr && stderr.slice ? stderr.slice(0, 2000) : stderr,
       });
 
+      pushJobDebug(job, 'ffmpeg_error', {
+        message: err?.message || null,
+        stack: err?.stack || null,
+      });
+
       try {
         if (fs.existsSync(outputPath)) {
           fs.unlinkSync(outputPath);
@@ -586,6 +623,10 @@ function startRenderJob(job, project, settings) {
     .on('end', () => {
       job.status = 'complete';
       job.progress = 100;
+
+      pushJobDebug(job, 'ffmpeg_complete', {
+        outputPath,
+      });
 
       debugLog('ffmpeg_complete', { jobId: job.id, outputPath });
 
@@ -612,6 +653,7 @@ function createJob({ project, settings, clientVersion }) {
     createdAt: new Date().toISOString(),
     clientVersion: clientVersion || null,
     downloadPath: null,
+    debug: [],
   };
 
   JOBS.set(id, job);
