@@ -2,6 +2,8 @@ const express = require('express');
 const fs = require('fs');
 const { createJob, getJob } = require('./jobs');
 
+const IS_DEV = process.env.NODE_ENV !== 'production';
+
 const router = express.Router();
 
 router.post('/', (req, res) => {
@@ -21,18 +23,14 @@ router.get('/:id', (req, res) => {
     return res.status(404).json({ error: 'not_found' });
   }
 
-  const response = {
+  return res.json({
     id: job.id,
     status: job.status,
     progress: typeof job.progress === 'number' ? job.progress : null,
     error: job.error,
-  };
-
-  if (job.status === 'complete') {
-    response.downloadUrl = `/exports/${job.id}/download`;
-  }
-
-  return res.json(response);
+    downloadUrl: job.downloadPath ? `/exports/${job.id}/download` : null,
+    debug: IS_DEV ? job.debug || [] : undefined,
+  });
 });
 
 router.get('/:id/download', (req, res) => {
