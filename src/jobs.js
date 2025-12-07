@@ -34,7 +34,9 @@ function debugError(label, payload) {
 }
 
 function pushJobDebug(job, label, payload) {
-  if (!IS_DEV || !job) return;
+    // Always record debug entries so the frontend can inspect them,
+      // even in production. Console logging is still dev-only.
+      if (!job) return;
   if (!job.debug) job.debug = [];
   // keep it bounded
   if (job.debug.length > 50) job.debug.shift();
@@ -579,6 +581,14 @@ function startRenderJob(job, project, settings) {
         });
       }
     })
+    .on('stderr', (line) => {
+          // Streaming ffmpeg stderr into both server logs and job.debug
+          debugLog('ffmpeg_stderr', {
+            jobId: job.id,
+            line,
+          });
+          pushJobDebug(job, 'ffmpeg_stderr', line);
+        })
     .on('progress', (progress) => {
       if (!JOBS.has(job.id)) {
         try {
@@ -603,10 +613,13 @@ function startRenderJob(job, project, settings) {
         stderr: stderr && stderr.slice ? stderr.slice(0, 2000) : stderr,
       });
 
-      pushJobDebug(job, 'ffmpeg_error', {
-        message: err?.message || null,
-        stack: err?.stack || null,
-      });
+        pushJobDebug(job, 'ffmpeg_error', {
+                errorMessage: err?.message || null,
+                errorCode: err?.code || null,
+                ffmpegCommand: lastFfmpegCommandLine,
+                stdout: stdout && stdout.slice ? stdout.slice(0, 2000) : stdout,
+                stderr: stderr && stderr.slice ? stderr.slice(0, 2000) : stderr,
+              });
 
       try {
         if (fs.existsSync(outputPath)) {
